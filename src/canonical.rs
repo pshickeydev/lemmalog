@@ -100,8 +100,20 @@ pub fn install_canonicalization(
     e: &mut Engine,
     preds: &[&str],
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let batch = e.install_program(CANONICAL_RULES)?;
+    let (batch_src, views_src) = canonicalization_sources(e, preds);
+    let batch = e.install_program(batch_src)?;
     e.seed_entities(preds);
+    if !views_src.is_empty() {
+        e.install_program(&views_src)?;
+    }
+    Ok(batch)
+}
+
+/// The rule sources `install_canonicalization` would install:
+/// (canonicalization batch, generated view rules — possibly empty).
+/// Callers that persist rule batches (e.g. `AgentMemory::install_rules`)
+/// use this to route both through their own bookkeeping.
+pub fn canonicalization_sources(e: &Engine, preds: &[&str]) -> (&'static str, String) {
     let mut views = String::new();
     let mut arities: Vec<(String, usize)> = Vec::new();
     for p in preds {
@@ -114,10 +126,7 @@ pub fn install_canonicalization(
     for (p, a) in &arities {
         views.push_str(&canonical_view_rule(p, *a));
     }
-    if !views.is_empty() {
-        e.install_program(&views)?;
-    }
-    Ok(batch)
+    (CANONICAL_RULES, views)
 }
 
 /// Current conflicts (topology violations to surface, not merge).

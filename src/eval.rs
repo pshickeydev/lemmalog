@@ -1673,6 +1673,30 @@ impl Engine {
         out
     }
 
+    /// Clause-level lookup for single-symbol program facts (`is_fact`
+    /// clauses like `exclusive("works_at").`). Unlike `query`, this does
+    /// not depend on `run()` having materialized the table, so update
+    /// policy checks see the tables from the moment the program is
+    /// installed.
+    pub fn table_holds(&self, pred: &str, sym: &str) -> bool {
+        self.clauses.iter().any(|c| {
+            c.is_fact
+                && c.head.pred == pred
+                && matches!(c.head.args.as_slice(), [crate::intern::Term::Sym(s)] if s == sym)
+        })
+    }
+
+    /// True for predicates that are (or were) rule-defined: current clause
+    /// heads, everything in `ever_derived` (rules may since have been
+    /// uninstalled, but their materialized rows are still derived state),
+    /// and aggregate temp relations. Used by snapshotting to persist only
+    /// genuine base facts.
+    pub fn is_derived_pred(&self, pred: &str) -> bool {
+        pred.starts_with("__agg:")
+            || self.ever_derived.contains(pred)
+            || self.clauses.iter().any(|c| c.head.pred == pred)
+    }
+
     pub fn fact(&self, pred: &str, args: &[Value]) -> Option<StoredFact> {
         self.relations.get(pred).and_then(|r| r.get(args)).cloned()
     }

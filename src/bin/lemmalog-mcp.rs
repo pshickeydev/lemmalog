@@ -143,9 +143,8 @@ fn parse_fact_atom(s: &str) -> Result<(String, Vec<String>), String> {
     if pred.is_empty() {
         return Err(format!("missing predicate: {s:?}"));
     }
-    let args: Vec<String> = s[open + 1..close]
-        .split(',')
-        .map(|a| a.trim().trim_matches('"').to_string())
+    let args: Vec<String> = lemmalog::agent::split_unquoted(&s[open + 1..close])
+        .into_iter()
         .map(|a| a.trim_matches('"').to_string())
         .collect();
     if args.iter().any(|a| a.is_empty()) {
@@ -270,7 +269,8 @@ fn tool_call(
         }
         "lemmalog_install_rules" => {
             let rules = args["rules"].as_str().unwrap_or_default();
-            match engine_of(state).install_program(rules) {
+            // via the facade so the batch is persisted by save/auto-save
+            match state.memory.install_rules(rules) {
                 Ok(id) => {
                     let n = engine_of(state).run();
                     Ok(format!("installed {id}; backfill derived +{n} facts"))
@@ -282,7 +282,7 @@ fn tool_call(
         }
         "lemmalog_uninstall" => {
             let id = args["id"].as_str().unwrap_or_default().to_string();
-            if engine_of(state).uninstall(&id) {
+            if state.memory.uninstall_rules(&id) {
                 let _ = engine_of(state).run();
                 Ok(format!("uninstalled {id}; derivations recomputed"))
             } else {
@@ -357,11 +357,28 @@ fn tool_call(
                     "isError": true
                 }));
             }
-            let e = engine_of(state);
-            for c in &aliases {
-                canonical::assert_alias(e, &c.subj, &c.obj, c.confidence);
+            {
+                let e = engine_of(state);
+                for c in &aliases {
+                    canonical::assert_alias(e, &c.subj, &c.obj, c.confidence);
+                }
             }
-            match canonical::install_canonicalization(e, &["current"]) {
+            // install via the facade so both batches persist (a server
+            // restart must not silently drop canonicalization)
+            let (batch_src, views_src) =
+                canonical::canonicalization_sources(&state.memory.engine, &["current"]);
+            let installed = state
+                .memory
+                .install_rules(batch_src)
+                .and_then(|_| {
+                    state.memory.engine.seed_entities(&["current"]);
+                    if views_src.is_empty() {
+                        Ok(String::new())
+                    } else {
+                        state.memory.install_rules(&views_src)
+                    }
+                });
+            match installed {
                 Ok(_) => {
                     let now = state.memory.engine.now;
                     let _ = state.memory.maintain(now);
@@ -434,7 +451,17 @@ fn tool_call(
         )
     {
         if let Some(p) = path {
-            let _ = state.memory.save(p);
+            // Auto-save after mutating calls; a failed save must not be
+            // silent (state loss) nor misreported as an input error, so
+            // surface it as a warning appended to the successful result.
+            if let Err(e) = state.memory.save(p) {
+                return Ok(json!({
+                    "content": [{"type": "text", "text": format!(
+                        "{text}\nWARNING: auto-save to {p} failed: {e} — memory is NOT persisted"
+                    )}],
+                    "isError": false
+                }));
+            }
         }
     }
     Ok(json!({

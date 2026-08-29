@@ -115,6 +115,16 @@ fn entity_token_problem(s: &str) -> Option<String> {
     }
 }
 
+/// A value the caller explicitly wrapped in quotes ("24.7GiB",
+/// "2026-08-28", "src/main.go:42") is deliberate, not leaked prose: only
+/// emptiness and unresolved-reference words are still rejected.
+fn quoted_token_problem(s: &str) -> Option<String> {
+    if s.is_empty() {
+        return Some("empty entity name".to_string());
+    }
+    None
+}
+
 fn valid_entity_token(s: &str) -> bool {
     entity_token_problem(s).is_none()
 }
@@ -137,9 +147,36 @@ pub fn parse_protocol_strict(text: &str, default_confidence: f64) -> Vec<Candida
         .collect()
 }
 
+/// Split on commas that are not inside double quotes. Used by the
+/// predicate-style line syntax and by the MCP `why` argument parser, so
+/// quoted entity names may contain commas (`"Doe, John"`).
+pub fn split_unquoted(s: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    for c in s.chars() {
+        match c {
+            '"' => {
+                in_quotes = !in_quotes;
+                cur.push(c);
+            }
+            ',' if !in_quotes => {
+                parts.push(cur.trim().to_string());
+                cur.clear();
+            }
+            _ => cur.push(c),
+        }
+    }
+    parts.push(cur.trim().to_string());
+    parts
+}
+
 /// One line of the protocol, or a reason it cannot parse.
 fn parse_line(raw: &str, default_confidence: f64) -> Result<CandidateFact, String> {
     let line = raw.trim();
+    if let Some(fact) = try_parse_predicate_line(line, default_confidence) {
+        return fact;
+    }
     let (s, rest) = line
         .split_once("--")
         .ok_or_else(|| "no `--rel-->` structure".to_string())?;
@@ -168,6 +205,50 @@ fn parse_line(raw: &str, default_confidence: f64) -> Result<CandidateFact, Strin
     })
 }
 
+/// Predicate-style line `pred(subject, "object")` — the anchoring syntax
+/// (`located(Entity, "file:line")`) from the agent skill schema. Returns
+/// `None` when the line is not predicate-shaped (the edge parser then
+/// produces the canonical drop reason). Quoted args keep their quotes so
+/// the strict validator can apply the relaxed quoted-token rules and
+/// strip them after validation, same as quoted edge-line values.
+fn try_parse_predicate_line(line: &str, default_confidence: f64) -> Option<Result<CandidateFact, String>> {
+    let open = line.find('(')?;
+    let close = line.rfind(')')?;
+    if close <= open || !line.ends_with(')') {
+        return None;
+    }
+    let pred = line[..open].trim();
+    if pred.is_empty()
+        || !pred
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    {
+        return None;
+    }
+    let parts = split_unquoted(&line[open + 1..close]);
+    if parts.len() != 2 {
+        return Some(Err(format!(
+            "predicate syntax takes exactly 2 args: pred(subject, object); got {}",
+            parts.len()
+        )));
+    }
+    Some(Ok(CandidateFact {
+        subj: parts[0].clone(),
+        pred: pred.to_string(),
+        obj: parts[1].clone(),
+        confidence: default_confidence,
+    }))
+}
+
+/// Strip one surrounding pair of double quotes, if present.
+fn strip_quotes(s: &str) -> String {
+    s.strip_prefix('"')
+        .and_then(|t| t.strip_suffix('"'))
+        .filter(|inner| !inner.is_empty())
+        .unwrap_or(s)
+        .to_string()
+}
+
 /// Line protocol shared by mock and LLM extractors: each line is
 /// `S --rel--> O` with optional per-fact confidence `S --rel[0.8]--> O`.
 /// Unparseable lines are skipped (extraction is best-effort).
@@ -192,19 +273,37 @@ pub fn parse_protocol_reported(
             continue;
         }
         match parse_line(raw, default_confidence) {
-            Ok(c) => {
-                let problem = entity_token_problem(&c.subj)
-                    .or_else(|| entity_token_problem(&c.obj))
-                    .or_else(|| {
-                        if c.pred
-                            .chars()
-                            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
-                        {
-                            None
-                        } else {
-                            Some("relation must be lower snake_case (e.g. works_at)".to_string())
-                        }
-                    });
+            Ok(mut c) => {
+                let subj_quoted = is_quoted(&c.subj);
+                let obj_quoted = is_quoted(&c.obj);
+                if subj_quoted {
+                    c.subj = strip_quotes(&c.subj);
+                }
+                if obj_quoted {
+                    c.obj = strip_quotes(&c.obj);
+                }
+                let problem = if subj_quoted {
+                    quoted_token_problem(&c.subj)
+                } else {
+                    entity_token_problem(&c.subj)
+                }
+                .or_else(|| {
+                    if obj_quoted {
+                        quoted_token_problem(&c.obj)
+                    } else {
+                        entity_token_problem(&c.obj)
+                    }
+                })
+                .or_else(|| {
+                    if c.pred
+                        .chars()
+                        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
+                    {
+                        None
+                    } else {
+                        Some("relation must be lower snake_case (e.g. works_at)".to_string())
+                    }
+                });
                 match problem {
                     Some(reason) => dropped.push((raw.trim().to_string(), reason)),
                     None => facts.push(c),
@@ -214,6 +313,10 @@ pub fn parse_protocol_reported(
         }
     }
     (facts, dropped)
+}
+
+fn is_quoted(s: &str) -> bool {
+    s.len() >= 2 && s.starts_with('"') && s.ends_with('"')
 }
 
 /// An [`Extractor`] whose extraction step is a caller-supplied model call —
@@ -302,6 +405,13 @@ pub struct AgentMemory<X: Extractor> {
     /// memory changes since then.
     last_turn_epoch: u64,
     extra_rules: String,
+    /// Sources of rule batches installed mid-session (after the default
+    /// rules and the constructor's `extra_rules`): (batch id, source) in
+    /// install order. Persisted by `save` so dynamically installed rules
+    /// survive reload. Ids are tracked explicitly because batches can be
+    /// appended behind them (canonicalization installs on the engine
+    /// directly), so position is not a stable key.
+    dynamic_rule_sources: Vec<(String, String)>,
     hyp_counter: u64,
 }
 
@@ -310,6 +420,12 @@ pub const DEFAULT_RULES: &str = "\
 current(E,R,O) :- edge(E,R,O,VF,VT,_), now(T), VF =< T, T < VT.
 # curated exclusivity table for the update policy
 exclusive(\"works_at\").
+# set-valued predicates: asserting another value is ordinary data, not a
+# conflict — the update policy does not escalate them.
+set_valued(\"recommendation\").
+set_valued(\"evidence\").
+set_valued(\"includes\").
+set_valued(\"located\").
 ";
 
 impl<X: Extractor> AgentMemory<X> {
@@ -327,6 +443,7 @@ impl<X: Extractor> AgentMemory<X> {
             episode_counter: 0,
             last_turn_epoch: 0,
             extra_rules: extra_rules.to_string(),
+            dynamic_rule_sources: Vec::new(),
             hyp_counter: 0,
         })
     }
@@ -386,6 +503,7 @@ impl<X: Extractor> AgentMemory<X> {
     /// - open fact with same (S,P,O)       -> NOOP (annotation merge)
     /// - open fact with different O:
     ///     - P exclusive                   -> UPDATE (close old, assert new)
+    ///     - P set-valued                  -> ADD (multi-valued data)
     ///     - otherwise                     -> ADD + escalation
     fn apply_update(&mut self, c: &CandidateFact, ep: &Episode, report: &mut IngestReport) {
         let subj = self.engine.sym(&c.subj);
@@ -415,7 +533,8 @@ impl<X: Extractor> AgentMemory<X> {
             report.noop += 1;
             return;
         }
-        let exclusive = !self.engine.query("exclusive", &[Some(pred)]).is_empty();
+        let exclusive = !self.engine.query("exclusive", &[Some(pred)]).is_empty()
+            || self.engine.table_holds("exclusive", &c.pred);
         if exclusive {
             for old in &open {
                 let mut closed = old.clone();
@@ -427,14 +546,18 @@ impl<X: Extractor> AgentMemory<X> {
             report.updated += 1;
         } else {
             self.assert_open(&[subj, pred, obj], c.confidence, &ep.id);
-            let others: Vec<String> = open
-                .iter()
-                .map(|k| self.engine.interner.display(&k[2]))
-                .collect();
-            report.escalations.push(format!(
-                "conflict: {} --{}--> {} asserted in {}, but {} also open ({})",
-                c.subj, c.pred, c.obj, ep.id, c.pred, others.join(", ")
-            ));
+            let set_valued = !self.engine.query("set_valued", &[Some(pred)]).is_empty()
+                || self.engine.table_holds("set_valued", &c.pred);
+            if !set_valued {
+                let others: Vec<String> = open
+                    .iter()
+                    .map(|k| self.engine.interner.display(&k[2]))
+                    .collect();
+                report.escalations.push(format!(
+                    "conflict: {} --{}--> {} asserted in {}, but {} also open ({})",
+                    c.subj, c.pred, c.obj, ep.id, c.pred, others.join(", ")
+                ));
+            }
             report.added += 1;
         }
     }
@@ -505,14 +628,33 @@ impl<X: Extractor> AgentMemory<X> {
     }
 
     /// Agent tool surface: install a rule batch (versioned, revertable).
+    /// The batch source is remembered so `save` persists it. Installing
+    /// the exact same source twice is a no-op returning the existing
+    /// batch id — re-running an installer (e.g. canonicalization after a
+    /// reload) must not stack duplicate clauses.
     pub fn install_rules(&mut self, src: &str) -> Result<String, Box<dyn std::error::Error>> {
-        self.engine.install_program(src)
+        if let Some((id, _)) = self
+            .engine
+            .batches()
+            .into_iter()
+            .find(|(_, s)| s == src)
+        {
+            return Ok(id);
+        }
+        let id = self.engine.install_program(src)?;
+        self.dynamic_rule_sources.push((id.clone(), src.to_string()));
+        Ok(id)
     }
 
     /// Agent tool surface: uninstall a rule batch; derivations revert on
-    /// the next `maintain()`.
+    /// the next `maintain()`. A batch installed via `install_rules` also
+    /// drops out of the persisted set, so it stays gone after save/load.
     pub fn uninstall_rules(&mut self, id: &str) -> bool {
-        self.engine.uninstall(id)
+        let removed = self.engine.uninstall(id);
+        if removed {
+            self.dynamic_rule_sources.retain(|(bid, _)| bid != id);
+        }
+        removed
     }
 
     pub fn rule_batches(&self) -> Vec<(String, String)> {
@@ -778,6 +920,9 @@ impl<X: Extractor> AgentMemory<X> {
         let _ = writeln!(out, "{SNAPSHOT_MAGIC}");
         let _ = writeln!(out, "NOW\t{}", self.engine.now);
         let _ = writeln!(out, "RULES\t{}", esc(&self.extra_rules));
+        for (_, src) in &self.dynamic_rule_sources {
+            let _ = writeln!(out, "BATCH\t{}", esc(src));
+        }
         for ep in &self.episodes {
             let _ = writeln!(
                 out,
@@ -792,9 +937,12 @@ impl<X: Extractor> AgentMemory<X> {
             let _ = writeln!(out, "ESC\t{}", esc(e));
         }
         for (pred, rel) in &self.engine.relations {
-            // base facts only: skip predicates defined by rules (they are
-            // either program facts re-declared from rules, or derived)
-            if self.engine.clauses.iter().any(|c| c.head.pred == *pred) {
+            // base facts only: skip rule-defined predicates (current or
+            // uninstalled) and aggregate temp relations — all of it is
+            // derived state, rebuilt on load. Note the clause-head check
+            // alone is insufficient: an uninstalled rule's head is gone
+            // from `clauses` while its rows may still be materialized.
+            if self.engine.is_derived_pred(pred) {
                 continue;
             }
             for row in &rel.rows {
@@ -832,6 +980,7 @@ impl<X: Extractor> AgentMemory<X> {
             return Err("not a lemmalog snapshot".into());
         }
         let mut rules = String::new();
+        let mut batch_sources: Vec<String> = Vec::new();
         let mut now = 0i64;
         let mut episodes = Vec::new();
         let mut escalations = Vec::new();
@@ -843,6 +992,7 @@ impl<X: Extractor> AgentMemory<X> {
             match tag {
                 "NOW" => now = rest.parse()?,
                 "RULES" => rules = unesc(rest),
+                "BATCH" => batch_sources.push(unesc(rest)),
                 "EP" => {
                     let mut f = rest.splitn(4, '\t');
                     let (Some(id), Some(ts), Some(speaker), Some(txt)) =
@@ -890,6 +1040,9 @@ impl<X: Extractor> AgentMemory<X> {
             }
         }
         let mut m = AgentMemory::new(extractor, &rules)?;
+        for src in &batch_sources {
+            m.install_rules(src)?;
+        }
         m.escalations = escalations;
         m.episodes = episodes;
         m.episode_counter = m.episodes.len() as u64;
